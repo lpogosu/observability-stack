@@ -1,0 +1,21 @@
+extends: default
+
+rules:
+  # Series selectors in the promtool unit tests and healthcheck commands do not
+  # wrap without becoming unreadable, so the limit is generous rather than off:
+  # it still catches a line that has genuinely run away.
+  line-length:
+    max: 160
+  # `on:` in GitHub workflows is a key, not a boolean.
+  truthy:
+    check-keys: false
+  document-start: disable
+  comments:
+    min-spaces-from-content: 1
+  braces:
+    max-spaces-inside: 1
+  brackets:
+    max-spaces-inside: 1
+
+ignore: |
+  grafana/dashboards/
