@@ -1,0 +1,48 @@
+# Tooling configuration for every Python component in this repository.
+# The components ship as separate images with separate requirements.txt files;
+# only the lint/type/test configuration is shared, so this file has no [project]
+# table and is never packaged.
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["sample-app", "loadgen", "alert-sink"]
+
+[tool.ruff.lint]
+select = [
+    "A",    # shadowing builtins
+    "ARG",  # unused arguments
+    "B",    # bugbear
+    "C4",   # comprehensions
+    "DTZ",  # naive datetimes
+    "E",
+    "F",
+    "I",    # import order
+    "N",    # naming
+    "PTH",  # os.path -> pathlib
+    "RET",
+    "RUF",
+    "SIM",
+    "UP",
+    "W",
+]
+ignore = [
+    # FastAPI dependency parameters are declared but never read by the handler;
+    # that is the framework's calling convention, not dead code.
+    "ARG001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"*/tests/*" = ["ARG001", "ARG002"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = ["sample-app", "loadgen", "alert-sink"]
+warn_unreachable = true
+enable_error_code = ["redundant-expr", "possibly-undefined", "truthy-bool"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "sample-app/tests", "loadgen/tests", "alert-sink/tests"]
+pythonpath = ["sample-app", "loadgen", "alert-sink"]
+addopts = "-q --strict-markers"
