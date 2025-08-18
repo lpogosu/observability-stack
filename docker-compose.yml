@@ -1,0 +1,340 @@
+# Every image is pinned to an exact tag. `:latest` in a monitoring stack means
+# the thing that is supposed to tell you what changed is itself changing without
+# telling you.
+#
+# Log routing: containers carry an `observability.logs` label that Promtail's
+# service discovery filters on - `json` for the two services that emit one JSON
+# object per line, `raw` for third-party components whose format is not worth
+# inventing labels for.
+
+name: observability-stack
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+networks:
+  observability:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
+  loki-data:
+  tempo-data:
+
+services:
+  # ---------------------------------------------------------------------------
+  # The service under observation
+  # ---------------------------------------------------------------------------
+  sample-app:
+    build:
+      context: ./sample-app
+    image: observability-stack/sample-app:0.1.0
+    container_name: sample-app
+    restart: unless-stopped
+    environment:
+      OTEL_SERVICE_NAME: sample-app
+      SERVICE_VERSION: 0.1.0
+      DEPLOY_ENVIRONMENT: demo
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+      # Head sampling at 100% because the demo generates tens of requests per
+      # second, not tens of thousands. See "Решения и компромиссы" in the README
+      # for what changes at real volume.
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
+      BASE_LATENCY_SECONDS: "0.02"
+    ports:
+      - "8000:8000"
+    networks: [observability]
+    labels:
+      observability.logs: json
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # Not started by `docker compose up`: bring it in with a profile so the stack
+  # can idle without traffic. `make demo-errors` runs it with a scenario.
+  loadgen:
+    build:
+      context: ./loadgen
+    image: observability-stack/loadgen:0.1.0
+    profiles: ["load"]
+    networks: [observability]
+    depends_on:
+      sample-app:
+        condition: service_healthy
+    labels:
+      observability.logs: raw
+    logging: *default-logging
+    command: ["--scenario", "normal", "--target", "http://sample-app:8000"]
+
+  # ---------------------------------------------------------------------------
+  # Metrics
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.4.1
+    container_name: prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      # Lets `make reload` apply a rule change without losing the TSDB head.
+      - --web.enable-lifecycle
+      # Required for the trace-id exemplars the application attaches to its
+      # latency histogram; without it they are parsed and thrown away.
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks: [observability]
+    labels:
+      observability.logs: raw
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    container_name: alertmanager
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.external-url=http://localhost:9093
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "9093:9093"
+    networks: [observability]
+    labels:
+      observability.logs: raw
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9093/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  alert-sink:
+    build:
+      context: ./alert-sink
+    image: observability-stack/alert-sink:0.1.0
+    container_name: alert-sink
+    restart: unless-stopped
+    ports:
+      - "9095:9095"
+    networks: [observability]
+    labels:
+      observability.logs: json
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9095/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Logs
+  # ---------------------------------------------------------------------------
+  loki:
+    image: grafana/loki:3.5.1
+    container_name: loki
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    networks: [observability]
+    labels:
+      observability.logs: raw
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3100/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  promtail:
+    image: grafana/promtail:3.5.1
+    container_name: promtail
+    restart: unless-stopped
+    command: ["-config.file=/etc/promtail/promtail-config.yml"]
+    volumes:
+      - ./promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      # Docker service discovery reads container metadata and log streams
+      # straight from the daemon, which is the only thing that works identically
+      # on Linux and on Docker Desktop.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [observability]
+    depends_on:
+      loki:
+        condition: service_healthy
+    labels:
+      observability.logs: raw
+    logging: *default-logging
+    # No healthcheck: the promtail image is Debian-slim with neither wget nor
+    # curl, and a healthcheck that cannot run is worse than none - it reports
+    # "unhealthy" forever and trains people to ignore the column.
+
+  # ---------------------------------------------------------------------------
+  # Traces
+  # ---------------------------------------------------------------------------
+  tempo:
+    image: grafana/tempo:2.8.1
+    container_name: tempo
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yml"]
+    user: root
+    volumes:
+      - ./tempo/tempo.yml:/etc/tempo/tempo.yml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"
+    networks: [observability]
+    labels:
+      observability.logs: raw
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3200/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Exporters
+  # ---------------------------------------------------------------------------
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.26.0
+    container_name: blackbox-exporter
+    restart: unless-stopped
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    networks: [observability]
+    labels:
+      observability.logs: raw
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9115/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    container_name: node-exporter
+    restart: unless-stopped
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      # Docker's own bind mounts show up as separate filesystems on every
+      # container and would multiply the disk alerts by the number of running
+      # containers. Pseudo-filesystems are already excluded by the collector's
+      # own defaults, so only the mount points need overriding here.
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+)($$|/)
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    networks: [observability]
+    labels:
+      observability.logs: raw
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9100/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.52.1
+    container_name: cadvisor
+    restart: unless-stopped
+    command:
+      # cAdvisor's default collectors produce thousands of series per container.
+      # Only the four families the dashboards read are enabled here, and
+      # prometheus.yml drops the rest again on ingest.
+      - --docker_only=true
+      - --housekeeping_interval=15s
+      - --disable_metrics=percpu,sched,tcp,udp,advtcp,process,hugetlb,referenced_memory,cpu_topology,resctrl
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    networks: [observability]
+    labels:
+      observability.logs: raw
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Visualisation
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:12.0.2
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Anonymous viewers so the demo is one URL and no login. This is the one
+      # setting in this file that must not survive contact with a real network.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks: [observability]
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    labels:
+      observability.logs: raw
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
