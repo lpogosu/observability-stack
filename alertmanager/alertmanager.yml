@@ -1,0 +1,105 @@
+global:
+  # How long after the last firing evaluation an alert is declared resolved.
+  # Must be comfortably above Prometheus' evaluation_interval or every alert
+  # would flap between firing and resolved on a single missed evaluation.
+  resolve_timeout: 5m
+
+route:
+  # The default leaf. Anything that reaches it has no severity label, which is a
+  # bug in the rule - routing it to a real receiver makes that bug visible instead
+  # of silently dropping the alert.
+  receiver: fallback
+  group_by: ["alertname", "job"]
+  # 30s of collection before the first notification: long enough for a rollout
+  # that breaks five instances to arrive as one message, short enough not to
+  # noticeably delay a page.
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    # Meta-monitoring first: if the monitoring stack itself is broken, that fact
+    # outranks whatever it is currently reporting about the application.
+    - matchers:
+        - job=~"prometheus|alertmanager"
+      receiver: pager
+      group_by: ["alertname", "instance"]
+      group_wait: 10s
+      repeat_interval: 1h
+
+    - matchers:
+        - severity="critical"
+      receiver: pager
+      group_wait: 10s
+      group_interval: 5m
+      repeat_interval: 1h
+
+    - matchers:
+        - severity="warning"
+      receiver: tickets
+      # Warnings are tickets. Grouping them by service rather than by alert name
+      # means one ticket per degraded service, not one per symptom.
+      group_by: ["job"]
+      group_wait: 2m
+      group_interval: 30m
+      repeat_interval: 12h
+      mute_time_intervals:
+        - out-of-hours
+
+inhibit_rules:
+  # A service that is being paged for is already being worked on; its warnings
+  # add nothing but noise to the same incident.
+  - source_matchers:
+      - severity="critical"
+    target_matchers:
+      - severity="warning"
+    equal: ["job"]
+
+  # If the target cannot be scraped at all, every metric-derived alert about it
+  # is either stale or meaningless. The unreachable target is the real story.
+  - source_matchers:
+      - alertname="TargetDown"
+    target_matchers:
+      - alertname=~"ErrorBudgetBurn.*|LatencyBudgetBurn.*|HighErrorRatio|TrafficDropped"
+    equal: ["job"]
+
+  # A probe that fails is also, trivially, a probe that is slow.
+  - source_matchers:
+      - alertname="ProbeFailed"
+    target_matchers:
+      - alertname="ProbeSlow"
+    equal: ["instance"]
+
+time_intervals:
+  - name: out-of-hours
+    time_intervals:
+      - weekdays: ["saturday", "sunday"]
+        location: Europe/Moscow
+      - times:
+          - start_time: "20:00"
+            end_time: "24:00"
+          - start_time: "00:00"
+            end_time: "09:00"
+        location: Europe/Moscow
+
+receivers:
+  # All three receivers point at the local alert-sink so the demo has somewhere
+  # for alerts to land and be read back. In a real deployment these become
+  # PagerDuty / Telegram / a ticket API; the routing tree above does not change.
+  - name: pager
+    webhook_configs:
+      - url: http://alert-sink:9095/webhook/pager
+        send_resolved: true
+        max_alerts: 0
+
+  - name: tickets
+    webhook_configs:
+      - url: http://alert-sink:9095/webhook/tickets
+        send_resolved: true
+        max_alerts: 0
+
+  - name: fallback
+    webhook_configs:
+      - url: http://alert-sink:9095/webhook/fallback
+        send_resolved: true
+        max_alerts: 0
