@@ -1,0 +1,31 @@
+modules:
+  http_2xx:
+    prober: http
+    # Shorter than Prometheus' 10s scrape_timeout so a hung endpoint is reported
+    # as a failed probe rather than as a failed scrape - those are different
+    # incidents and they must not collapse into one.
+    timeout: 5s
+    http:
+      method: GET
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200]
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+      fail_if_body_not_matches_regexp:
+        - "."
+
+  http_post_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: POST
+      valid_status_codes: [200, 201, 202]
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+
+  tcp_connect:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
