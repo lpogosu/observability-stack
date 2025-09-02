@@ -1,0 +1,69 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Must match the scrape interval, otherwise Grafana picks a $__rate_interval
+      # that is shorter than the sampling and every rate() panel goes jagged.
+      timeInterval: 15s
+      httpMethod: POST
+      # Turns the exemplars the app attaches to its latency histogram into a
+      # clickable jump from a spike on the graph to the trace that caused it.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+          urlDisplayLabel: View trace
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      maxLines: 2000
+      derivedFields:
+        # The application logs JSON, so the trace id is matched in the raw line.
+        # This works even for lines Promtail failed to parse, which is exactly
+        # when you need the link most.
+        - name: trace_id
+          matcherRegex: '"trace_id":\s*"([a-f0-9]{32})"'
+          url: "${__value.raw}"
+          datasourceUid: tempo
+          urlDisplayLabel: Open trace
+
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        # Traces and logs are written by different pipelines with different
+        # buffering; a symmetric window around the span covers the skew.
+        spanStartTimeShift: -2m
+        spanEndTimeShift: 2m
+        filterByTraceID: true
+        filterBySpanID: false
+        tags:
+          - key: service.name
+            value: service
+      tracesToMetrics:
+        datasourceUid: prometheus
+        spanStartTimeShift: -2m
+        spanEndTimeShift: 2m
+        queries:
+          - name: Request rate for this route
+            query: 'sum(rate(http_requests_total{job="sample-app"}[$__rate_interval]))'
+      nodeGraph:
+        enabled: true
+      search:
+        hide: false
