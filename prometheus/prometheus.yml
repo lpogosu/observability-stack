@@ -1,0 +1,104 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  # Rules are evaluated at the scrape interval. Anything slower and the shortest
+  # burn-rate window (5m) would be built from too few points to be trustworthy.
+  evaluation_interval: 15s
+  external_labels:
+    cluster: local
+    environment: demo
+
+# Exemplar storage is opt-in (`--enable-feature=exemplar-storage`). It is what
+# links a spike on a latency panel to the trace that produced it; without it the
+# exemplars the application emits are parsed and discarded.
+storage:
+  exemplars:
+    max_exemplars: 100000
+
+rule_files:
+  # Resolved relative to this file, so the same config works under
+  # `promtool check config` in CI and under /etc/prometheus in the container.
+  - rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  # --- the monitoring stack watching itself ---------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
+
+  - job_name: grafana
+    static_configs:
+      - targets: ["grafana:3000"]
+
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+
+  - job_name: tempo
+    static_configs:
+      - targets: ["tempo:3200"]
+
+  # --- the service under observation ----------------------------------------
+  - job_name: sample-app
+    # 5s here rather than the global 15s: the demo scenarios are minutes long and
+    # a coarser interval would make the histogram too sparse to be convincing.
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["sample-app:8000"]
+
+  # --- infrastructure --------------------------------------------------------
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+    metric_relabel_configs:
+      # cAdvisor is the single largest cardinality source in this stack: it emits
+      # per-container series for every cgroup metric, including short-lived ones.
+      # Only the four families the dashboards actually read are kept.
+      - source_labels: [__name__]
+        regex: "container_(cpu_usage_seconds_total|memory_working_set_bytes|network_receive_bytes_total|network_transmit_bytes_total|last_seen)"
+        action: keep
+      # Containers with no name are the pause/scope cgroups - pure noise.
+      - source_labels: [name]
+        regex: ""
+        action: drop
+      - regex: "id|image|container_label_.*"
+        action: labeldrop
+
+  - job_name: blackbox-exporter
+    static_configs:
+      - targets: ["blackbox-exporter:9115"]
+
+  # --- end-to-end probes -----------------------------------------------------
+  # These answer a question in-process metrics cannot: "can something outside the
+  # process complete a request?" An app that has deadlocked its event loop still
+  # exposes a perfectly healthy /metrics from a background thread.
+  - job_name: blackbox-http
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - http://sample-app:8000/healthz
+          - http://sample-app:8000/api/items
+          - http://grafana:3000/api/health
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
