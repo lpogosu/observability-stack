@@ -1,0 +1,310 @@
+# Alerting rules.
+#
+# Two principles are enforced here:
+#   * every alert is a symptom a user can feel (requests fail, requests are slow,
+#     the endpoint is unreachable, the disk is about to stop accepting writes) -
+#     causes such as CPU saturation or container restarts are dashboard material,
+#     not pages;
+#   * every alert carries `summary`, `description` and `runbook_url`, so the person
+#     woken up at 03:00 never has to reverse-engineer the PromQL.
+#
+# Severity contract:
+#   critical - a human is paged now, the error budget is burning fast enough that
+#              the monthly objective is lost within days.
+#   warning  - a ticket for the next working day.
+groups:
+  # ---------------------------------------------------------------------------
+  # Availability SLO: 99.9% of requests answered without a 5xx over 30 days.
+  # Error budget = 0.1% of requests.
+  # ---------------------------------------------------------------------------
+  - name: slo_availability
+    rules:
+      - alert: ErrorBudgetBurnFast
+        # 14.4x burn rate: the whole 30-day budget is gone in ~2 days.
+        # The short 5m window is an "is it still happening right now" guard that
+        # makes the alert resolve quickly once the incident is over.
+        expr: |
+          (
+            job:http_requests_errors:ratio_rate1h{job="sample-app"} > (14.4 * 0.001)
+          and
+            job:http_requests_errors:ratio_rate5m{job="sample-app"} > (14.4 * 0.001)
+          )
+        for: 2m
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "Availability error budget burning at 14.4x on {{ $labels.job }}"
+          description: >-
+            {{ $labels.job }} is returning {{ $value | humanizePercentage }} 5xx over the
+            last hour and the last 5 minutes. At this rate the 30-day availability budget
+            (99.9%) is exhausted in about 2 days.
+          runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#errorbudgetburnfast
+
+      - alert: ErrorBudgetBurnSlow
+        # 6x burn rate: budget gone in ~5 days. Not worth waking anyone, but it
+        # must not be ignored either - hence a ticket, not a page.
+        expr: |
+          (
+            job:http_requests_errors:ratio_rate6h{job="sample-app"} > (6 * 0.001)
+          and
+            job:http_requests_errors:ratio_rate30m{job="sample-app"} > (6 * 0.001)
+          )
+        for: 15m
+        labels:
+          severity: warning
+          slo: availability
+        annotations:
+          summary: "Availability error budget burning at 6x on {{ $labels.job }}"
+          description: >-
+            {{ $labels.job }} is returning {{ $value | humanizePercentage }} 5xx over the
+            last 6 hours. At this rate the 30-day availability budget is exhausted in about
+            5 days. Investigate during working hours.
+          runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#errorbudgetburnslow
+
+      - alert: HighErrorRatio
+        # Backstop for HTTP jobs that have no SLO document yet. Deliberately coarse:
+        # it only catches an outage, never a slow degradation, and it is a ticket.
+        # Jobs covered by a burn-rate alert are excluded so the two never duplicate.
+        expr: job:http_requests_errors:ratio_rate5m{job!="sample-app"} > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.job }} is failing {{ $value | humanizePercentage }} of requests"
+          description: >-
+            More than 5% of requests to {{ $labels.job }} returned 5xx over the last
+            5 minutes. This job has no SLO definition, so the threshold is a flat one -
+            add it to slo/ if the service is user-facing.
+          runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#higherrorratio
+
+  # ---------------------------------------------------------------------------
+  # Latency SLO: 99% of requests served in under 300 ms over 30 days.
+  # Error budget = 1% of requests.
+  # ---------------------------------------------------------------------------
+  - name: slo_latency
+    rules:
+      - alert: LatencyBudgetBurnFast
+        expr: |
+          (
+            job:http_request_duration_seconds:slow_ratio_rate1h{job="sample-app"} > (14.4 * 0.01)
+          and
+            job:http_request_duration_seconds:slow_ratio_rate5m{job="sample-app"} > (14.4 * 0.01)
+          )
+        for: 2m
+        labels:
+          severity: critical
+          slo: latency
+        annotations:
+          summary: "Latency error budget burning at 14.4x on {{ $labels.job }}"
+          description: >-
+            {{ $value | humanizePercentage }} of requests to {{ $labels.job }} took longer
+            than 300 ms over the last hour. At this rate the 30-day latency budget
+            (99% under 300 ms) is exhausted in about 2 days.
+          runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#latencybudgetburnfast
+
+      - alert: LatencyBudgetBurnSlow
+        expr: |
+          (
+            job:http_request_duration_seconds:slow_ratio_rate6h{job="sample-app"} > (6 * 0.01)
+          and
+            job:http_request_duration_seconds:slow_ratio_rate30m{job="sample-app"} > (6 * 0.01)
+          )
+        for: 15m
+        labels:
+          severity: warning
+          slo: latency
+        annotations:
+          summary: "Latency error budget burning at 6x on {{ $labels.job }}"
+          description: >-
+            {{ $value | humanizePercentage }} of requests to {{ $labels.job }} took longer
+            than 300 ms over the last 6 hours. The 30-day latency budget is exhausted in
+            about 5 days at this rate.
+          runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#latencybudgetburnslow
+
+  # ---------------------------------------------------------------------------
+  # Traffic. A service that stopped receiving requests looks perfectly healthy to
+  # every ratio-based alert above - the denominator disappears with the numerator.
+  # ---------------------------------------------------------------------------
+  - name: traffic
+    rules:
+      - alert: TrafficDropped
+        # Compared against the 6h baseline rather than the 1h one: with a 1h
+        # baseline the alert would resolve itself an hour after the outage started,
+        # exactly when someone finally looks at it.
+        expr: |
+          (
+            job:http_requests:rate5m{job="sample-app"}
+              < 0.25 * job:http_requests:rate6h{job="sample-app"}
+          and
+            job:http_requests:rate6h{job="sample-app"} > 1
+          )
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Request rate to {{ $labels.job }} fell to {{ $value | printf \"%.2f\" }} req/s"
+          description: >-
+            {{ $labels.job }} is serving less than a quarter of its 6-hour baseline traffic.
+            Either an upstream stopped calling it, or requests are failing before they reach
+            the instrumentation (ingress, DNS, TLS).
+          runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#trafficdropped
+
+  # ---------------------------------------------------------------------------
+  # Reachability. In-app metrics can only report failures the app survived;
+  # blackbox probes and `up` cover the cases where it did not.
+  # ---------------------------------------------------------------------------
+  - name: availability_probes
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus cannot scrape {{ $labels.job }} at {{ $labels.instance }}"
+          description: >-
+            The scrape of {{ $labels.instance }} (job {{ $labels.job }}) has been failing for
+            5 minutes. Until it recovers every rule built on this job's metrics is blind, so
+            treat a silent dashboard as unknown, not as healthy.
+          runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#targetdown
+
+      - alert: ProbeFailed
+        expr: probe_success == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Blackbox probe of {{ $labels.instance }} is failing"
+          description: >-
+            The {{ $labels.module }} probe of {{ $labels.instance }} has failed for 3 minutes.
+            This is an end-to-end check from outside the process, so it also covers the
+            listener, the network path and TLS - things the application's own metrics cannot
+            report on.
+          runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#probefailed
+
+      - alert: ProbeSlow
+        expr: probe_duration_seconds > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Blackbox probe of {{ $labels.instance }} takes {{ $value | printf \"%.2f\" }}s"
+          description: >-
+            End-to-end probe latency for {{ $labels.instance }} has been above 1 second for
+            10 minutes while the in-process latency SLI may still look fine. Suspect the
+            layers between the probe and the handler: accept queue, proxy, DNS.
+          runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#probeslow
+
+  # ---------------------------------------------------------------------------
+  # Host resources. Only the two that turn into user-visible failure if ignored:
+  # a full filesystem and memory exhaustion. CPU saturation is on the dashboards.
+  # ---------------------------------------------------------------------------
+  - name: host_resources
+    rules:
+      - alert: DiskSpaceLow
+        # Level alone is a bad predicate: a partition that sits at 8% free for a year
+        # is not an incident. The trend term makes this fire only when the free space
+        # is actually heading for zero within a day.
+        #
+        # The fstype exclusion is longer than it looks like it needs to be, and every
+        # entry was earned. tmpfs/ramfs are memory. overlay/squashfs are the container
+        # image, which is read-only. 9p and fuse are pass-through mounts - on Docker
+        # Desktop node-exporter sees the Windows C: drive four times through WSL's
+        # bind mounts, and paging about somebody else's disk from inside a container
+        # is the fastest way to teach people to mute this alert. nfs/cifs are somebody
+        # else's disk for the same reason.
+        expr: |
+          (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|9p|fuse.*|nfs.*|cifs|autofs"}
+              /
+            node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|9p|fuse.*|nfs.*|cifs|autofs"}
+          ) < 0.10
+          and
+          predict_linear(
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|9p|fuse.*|nfs.*|cifs|autofs"}[6h],
+            24 * 3600
+          ) < 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.mountpoint }} on {{ $labels.instance }} is {{ $value | humanizePercentage }} free and shrinking"
+          description: >-
+            Less than 10% of {{ $labels.mountpoint }} is free on {{ $labels.instance }} and the
+            6-hour trend puts it at zero within 24 hours. A full filesystem takes the whole
+            node down, including the parts that would tell you why.
+          runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#diskspacelow
+
+      - alert: DiskWillFillSoon
+        expr: |
+          (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|9p|fuse.*|nfs.*|cifs|autofs"}
+              /
+            node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|9p|fuse.*|nfs.*|cifs|autofs"}
+          ) < 0.05
+          and
+          predict_linear(
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|9p|fuse.*|nfs.*|cifs|autofs"}[1h],
+            4 * 3600
+          ) < 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.mountpoint }} on {{ $labels.instance }} fills up within 4 hours"
+          description: >-
+            {{ $labels.mountpoint }} on {{ $labels.instance }} is below 5% free and, at the
+            rate of the last hour, reaches zero in under 4 hours. Free space now; do not wait
+            for the ticket queue.
+          runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#diskwillfillsoon
+
+      - alert: MemoryPressure
+        # MemAvailable, not MemFree: page cache is reclaimable and counting it as
+        # used produces a permanent false positive on every healthy Linux box.
+        expr: |
+          (
+            1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+          ) > 0.90
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} has {{ $value | humanizePercentage }} of memory committed"
+          description: >-
+            Less than 10% of memory on {{ $labels.instance }} is available for 15 minutes.
+            The next allocation spike ends in the OOM killer picking a process, and it will
+            not pick the one you would have chosen.
+          runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#memorypressure
+
+  # ---------------------------------------------------------------------------
+  # Meta-monitoring. A monitoring stack that fails silently is worse than none,
+  # because it also removes the suspicion that something might be wrong.
+  # ---------------------------------------------------------------------------
+  - name: meta
+    rules:
+      - alert: PrometheusRuleEvaluationFailing
+        expr: rate(prometheus_rule_evaluation_failures_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus is failing to evaluate rules in group {{ $labels.rule_group }}"
+          description: >-
+            Rule evaluation in {{ $labels.rule_group }} has been failing for 10 minutes on
+            {{ $labels.instance }}. Recording rules stop producing series and every alert
+            built on them goes silent - which reads exactly like "everything is fine".
+          runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#prometheusruleevaluationfailing
+
+      - alert: AlertmanagerNotificationsFailing
+        expr: rate(alertmanager_notifications_failed_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Alertmanager cannot deliver via {{ $labels.integration }}"
+          description: >-
+            Notifications through {{ $labels.integration }} have been failing for 10 minutes
+            on {{ $labels.instance }}. Alerts are being generated and grouped but nobody is
+            receiving them.
+          runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#alertmanagernotificationsfailing

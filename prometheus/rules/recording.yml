@@ -1,0 +1,130 @@
+# Recording rules follow the `level:metric:operations` convention:
+#   level      - labels that survive the aggregation (job, or job_path)
+#   metric     - the source metric without its unit suffix
+#   operations - the chain of operations applied, innermost last
+#
+# Everything an alert or a dashboard needs is precomputed here for two reasons:
+#   1. burn-rate alerts evaluate four ranges (5m/30m/1h/6h) over the same series;
+#      recording them once keeps rule evaluation cheap and, more importantly, keeps
+#      the alert expression short enough to read;
+#   2. the aggregations drop `instance`, `method` and `status` - the labels that
+#      grow without bound - so dashboards query low-cardinality series instead of
+#      re-aggregating raw ones on every refresh.
+groups:
+  - name: red_traffic
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+
+      - record: job:http_requests:rate1h
+        expr: sum by (job) (rate(http_requests_total[1h]))
+
+      - record: job:http_requests:rate6h
+        expr: sum by (job) (rate(http_requests_total[6h]))
+
+      - record: job:http_requests_errors:rate5m
+        expr: sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+
+      - record: job_path:http_requests:rate5m
+        expr: sum by (job, path) (rate(http_requests_total[5m]))
+
+  - name: red_errors
+    rules:
+      # Availability SLI: share of requests answered with a 5xx.
+      # 4xx stays out of the numerator on purpose - a client sending a malformed
+      # body is not the service failing its objective.
+      - record: job:http_requests_errors:ratio_rate5m
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+            /
+          sum by (job) (rate(http_requests_total[5m]))
+
+      - record: job:http_requests_errors:ratio_rate30m
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[30m]))
+            /
+          sum by (job) (rate(http_requests_total[30m]))
+
+      - record: job:http_requests_errors:ratio_rate1h
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[1h]))
+            /
+          sum by (job) (rate(http_requests_total[1h]))
+
+      - record: job:http_requests_errors:ratio_rate6h
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[6h]))
+            /
+          sum by (job) (rate(http_requests_total[6h]))
+
+      - record: job_path:http_requests_errors:ratio_rate5m
+        expr: |
+          sum by (job, path) (rate(http_requests_total{status=~"5.."}[5m]))
+            /
+          sum by (job, path) (rate(http_requests_total[5m]))
+
+  - name: red_latency
+    rules:
+      # Latency SLI: share of requests slower than the 300 ms objective.
+      # Computed from the `le="0.3"` bucket rather than from a quantile, because a
+      # quantile of a quantile is meaningless once you aggregate across instances,
+      # and because the bucket boundary is exactly what the SLO is written against.
+      - record: job:http_request_duration_seconds:slow_ratio_rate5m
+        expr: |
+          1 - (
+            sum by (job) (rate(http_request_duration_seconds_bucket{le="0.3"}[5m]))
+              /
+            sum by (job) (rate(http_request_duration_seconds_count[5m]))
+          )
+
+      - record: job:http_request_duration_seconds:slow_ratio_rate30m
+        expr: |
+          1 - (
+            sum by (job) (rate(http_request_duration_seconds_bucket{le="0.3"}[30m]))
+              /
+            sum by (job) (rate(http_request_duration_seconds_count[30m]))
+          )
+
+      - record: job:http_request_duration_seconds:slow_ratio_rate1h
+        expr: |
+          1 - (
+            sum by (job) (rate(http_request_duration_seconds_bucket{le="0.3"}[1h]))
+              /
+            sum by (job) (rate(http_request_duration_seconds_count[1h]))
+          )
+
+      - record: job:http_request_duration_seconds:slow_ratio_rate6h
+        expr: |
+          1 - (
+            sum by (job) (rate(http_request_duration_seconds_bucket{le="0.3"}[6h]))
+              /
+            sum by (job) (rate(http_request_duration_seconds_count[6h]))
+          )
+
+      - record: job:http_request_duration_seconds:p50_rate5m
+        expr: |
+          histogram_quantile(
+            0.50,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[5m]))
+          )
+
+      - record: job:http_request_duration_seconds:p90_rate5m
+        expr: |
+          histogram_quantile(
+            0.90,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[5m]))
+          )
+
+      - record: job:http_request_duration_seconds:p99_rate5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[5m]))
+          )
+
+      - record: job_path:http_request_duration_seconds:p99_rate5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (job, path, le) (rate(http_request_duration_seconds_bucket[5m]))
+          )
