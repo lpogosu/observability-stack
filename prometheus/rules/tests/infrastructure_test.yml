@@ -1,0 +1,298 @@
+# Unit tests for reachability, host-resource and meta-monitoring alerts.
+#
+# The disk cases are the interesting ones: they prove that a partition sitting at
+# a low but stable level does not alert, and that only a partition actually
+# heading for zero does. That distinction is the difference between a useful disk
+# alert and the one everybody mutes.
+rule_files:
+  - ../recording.yml
+  - ../alerting.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    name: a target that stops responding pages after five minutes
+    input_series:
+      - series: 'up{job="sample-app", instance="sample-app:8000"}'
+        values: "1+0x10 0+0x20"
+
+    alert_rule_test:
+      - eval_time: 13m
+        alertname: TargetDown
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TargetDown
+        exp_alerts:
+          - exp_labels:
+              alertname: TargetDown
+              job: sample-app
+              instance: sample-app:8000
+              severity: critical
+            exp_annotations:
+              summary: "Prometheus cannot scrape sample-app at sample-app:8000"
+              description: >-
+                The scrape of sample-app:8000 (job sample-app) has been failing for 5 minutes.
+                Until it recovers every rule built on this job's metrics is blind, so treat a
+                silent dashboard as unknown, not as healthy.
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#targetdown
+
+  - interval: 1m
+    name: a failing blackbox probe pages independently of in-app metrics
+    input_series:
+      - series: 'probe_success{job="blackbox-http", instance="http://sample-app:8000/healthz", module="http_2xx"}'
+        values: "1+0x10 0+0x20"
+      - series: 'probe_duration_seconds{job="blackbox-http", instance="http://sample-app:8000/healthz", module="http_2xx"}'
+        values: "0.05+0x31"
+
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: ProbeFailed
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: ProbeFailed
+        exp_alerts:
+          - exp_labels:
+              alertname: ProbeFailed
+              job: blackbox-http
+              instance: http://sample-app:8000/healthz
+              module: http_2xx
+              severity: critical
+            exp_annotations:
+              summary: "Blackbox probe of http://sample-app:8000/healthz is failing"
+              description: >-
+                The http_2xx probe of http://sample-app:8000/healthz has failed for 3 minutes.
+                This is an end-to-end check from outside the process, so it also covers the
+                listener, the network path and TLS - things the application's own metrics
+                cannot report on.
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#probefailed
+      - eval_time: 20m
+        alertname: ProbeSlow
+        exp_alerts: []
+
+  - interval: 1m
+    name: a probe that succeeds slowly opens a ticket
+    input_series:
+      - series: 'probe_success{job="blackbox-http", instance="http://sample-app:8000/api/items", module="http_2xx"}'
+        values: "1+0x40"
+      - series: 'probe_duration_seconds{job="blackbox-http", instance="http://sample-app:8000/api/items", module="http_2xx"}'
+        values: "0.2+0x10 1.5+0x30"
+
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ProbeSlow
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: ProbeSlow
+        exp_alerts:
+          - exp_labels:
+              alertname: ProbeSlow
+              job: blackbox-http
+              instance: http://sample-app:8000/api/items
+              module: http_2xx
+              severity: warning
+            exp_annotations:
+              summary: "Blackbox probe of http://sample-app:8000/api/items takes 1.50s"
+              description: >-
+                End-to-end probe latency for http://sample-app:8000/api/items has been above
+                1 second for 10 minutes while the in-process latency SLI may still look fine.
+                Suspect the layers between the probe and the handler: accept queue, proxy, DNS.
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#probeslow
+      - eval_time: 25m
+        alertname: ProbeFailed
+        exp_alerts: []
+
+  - interval: 5m
+    name: a partition low on space but not shrinking does not alert
+    input_series:
+      - series: 'node_filesystem_size_bytes{job="node-exporter", instance="node-exporter:9100", device="/dev/sda1", fstype="ext4", mountpoint="/"}'
+        values: "100000000000+0x90"
+      # 8% free and perfectly flat: annoying, not an incident.
+      - series: 'node_filesystem_avail_bytes{job="node-exporter", instance="node-exporter:9100", device="/dev/sda1", fstype="ext4", mountpoint="/"}'
+        values: "8000000000+0x90"
+
+    alert_rule_test:
+      - eval_time: 6h
+        alertname: DiskSpaceLow
+        exp_alerts: []
+      - eval_time: 6h
+        alertname: DiskWillFillSoon
+        exp_alerts: []
+
+  - interval: 5m
+    name: a partition on track to fill within a day opens a ticket
+    input_series:
+      - series: 'node_filesystem_size_bytes{job="node-exporter", instance="node-exporter:9100", device="/dev/sda1", fstype="ext4", mountpoint="/"}'
+        values: "100000000000+0x90"
+      # 9.5 GB free, losing 100 MB every five minutes -> zero in about 8 hours.
+      - series: 'node_filesystem_avail_bytes{job="node-exporter", instance="node-exporter:9100", device="/dev/sda1", fstype="ext4", mountpoint="/"}'
+        values: "9500000000-100000000x90"
+
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: DiskSpaceLow
+        exp_alerts: []
+      - eval_time: 1h
+        alertname: DiskSpaceLow
+        exp_alerts:
+          - exp_labels:
+              alertname: DiskSpaceLow
+              job: node-exporter
+              instance: node-exporter:9100
+              device: /dev/sda1
+              fstype: ext4
+              mountpoint: /
+              severity: warning
+            exp_annotations:
+              summary: "/ on node-exporter:9100 is 8.3% free and shrinking"
+              description: >-
+                Less than 10% of / is free on node-exporter:9100 and the 6-hour trend puts it
+                at zero within 24 hours. A full filesystem takes the whole node down,
+                including the parts that would tell you why.
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#diskspacelow
+      # Still above 5% free, so the page has not been raised yet.
+      - eval_time: 1h
+        alertname: DiskWillFillSoon
+        exp_alerts: []
+
+  - interval: 1m
+    name: a partition below five percent and falling pages
+    input_series:
+      - series: 'node_filesystem_size_bytes{job="node-exporter", instance="node-exporter:9100", device="/dev/sdb1", fstype="xfs", mountpoint="/var/lib/pgsql"}'
+        values: "100000000000+0x60"
+      - series: 'node_filesystem_avail_bytes{job="node-exporter", instance="node-exporter:9100", device="/dev/sdb1", fstype="xfs", mountpoint="/var/lib/pgsql"}'
+        values: "4000000000-20000000x60"
+
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: DiskWillFillSoon
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: DiskWillFillSoon
+        exp_alerts:
+          - exp_labels:
+              alertname: DiskWillFillSoon
+              job: node-exporter
+              instance: node-exporter:9100
+              device: /dev/sdb1
+              fstype: xfs
+              mountpoint: /var/lib/pgsql
+              severity: critical
+            exp_annotations:
+              summary: "/var/lib/pgsql on node-exporter:9100 fills up within 4 hours"
+              description: >-
+                /var/lib/pgsql on node-exporter:9100 is below 5% free and, at the rate of the
+                last hour, reaches zero in under 4 hours. Free space now; do not wait for the
+                ticket queue.
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#diskwillfillsoon
+      # The warning has a longer `for`, so at this point only the page exists.
+      # Once both are firing Alertmanager inhibits the warning - see alertmanager.yml.
+      - eval_time: 20m
+        alertname: DiskSpaceLow
+        exp_alerts: []
+
+  - interval: 1m
+    name: memory-backed and pass-through mounts are excluded from disk alerts
+    input_series:
+      # tmpfs is RAM, not a disk.
+      - series: 'node_filesystem_size_bytes{job="node-exporter", instance="node-exporter:9100", device="tmpfs", fstype="tmpfs", mountpoint="/run"}'
+        values: "1000000000+0x60"
+      - series: 'node_filesystem_avail_bytes{job="node-exporter", instance="node-exporter:9100", device="tmpfs", fstype="tmpfs", mountpoint="/run"}'
+        values: "40000000-500000x60"
+      # 9p is how Docker Desktop passes the Windows drive into the WSL VM. It is
+      # somebody else's disk, and it appears several times through bind mounts -
+      # exactly the shape that turns one full drive into four identical pages.
+      - series: 'node_filesystem_size_bytes{job="node-exporter", instance="node-exporter:9100", device="drivers", fstype="9p", mountpoint="/mnt/host/c"}'
+        values: "500000000000+0x60"
+      - series: 'node_filesystem_avail_bytes{job="node-exporter", instance="node-exporter:9100", device="drivers", fstype="9p", mountpoint="/mnt/host/c"}'
+        values: "5000000000-30000000x60"
+      # An NFS share is the same argument: the capacity belongs to another host.
+      - series: 'node_filesystem_size_bytes{job="node-exporter", instance="node-exporter:9100", device="nas:/vol0", fstype="nfs4", mountpoint="/mnt/nas"}'
+        values: "500000000000+0x60"
+      - series: 'node_filesystem_avail_bytes{job="node-exporter", instance="node-exporter:9100", device="nas:/vol0", fstype="nfs4", mountpoint="/mnt/nas"}'
+        values: "1000000000-10000000x60"
+
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: DiskSpaceLow
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: DiskWillFillSoon
+        exp_alerts: []
+
+  - interval: 1m
+    name: memory pressure is measured against MemAvailable, not MemFree
+    input_series:
+      - series: 'node_memory_MemTotal_bytes{job="node-exporter", instance="node-exporter:9100"}'
+        values: "8000000000+0x41"
+      - series: 'node_memory_MemAvailable_bytes{job="node-exporter", instance="node-exporter:9100"}'
+        values: "4000000000+0x10 600000000+0x30"
+
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: MemoryPressure
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: MemoryPressure
+        exp_alerts:
+          - exp_labels:
+              alertname: MemoryPressure
+              job: node-exporter
+              instance: node-exporter:9100
+              severity: warning
+            exp_annotations:
+              summary: "node-exporter:9100 has 92.5% of memory committed"
+              description: >-
+                Less than 10% of memory on node-exporter:9100 is available for 15 minutes.
+                The next allocation spike ends in the OOM killer picking a process, and it
+                will not pick the one you would have chosen.
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#memorypressure
+
+  - interval: 1m
+    name: the monitoring stack alerts on its own failures
+    input_series:
+      - series: 'prometheus_rule_evaluation_failures_total{job="prometheus", instance="prometheus:9090", rule_group="red_errors"}'
+        values: "0+0x10 0+2x30"
+      - series: 'alertmanager_notifications_failed_total{job="alertmanager", instance="alertmanager:9093", integration="webhook", reason="clientError"}'
+        values: "0+0x10 0+1x30"
+
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: PrometheusRuleEvaluationFailing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: PrometheusRuleEvaluationFailing
+        exp_alerts:
+          - exp_labels:
+              alertname: PrometheusRuleEvaluationFailing
+              job: prometheus
+              instance: prometheus:9090
+              rule_group: red_errors
+              severity: critical
+            exp_annotations:
+              summary: "Prometheus is failing to evaluate rules in group red_errors"
+              description: >-
+                Rule evaluation in red_errors has been failing for 10 minutes on
+                prometheus:9090. Recording rules stop producing series and every alert built
+                on them goes silent - which reads exactly like "everything is fine".
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#prometheusruleevaluationfailing
+      - eval_time: 15m
+        alertname: AlertmanagerNotificationsFailing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: AlertmanagerNotificationsFailing
+        exp_alerts:
+          - exp_labels:
+              alertname: AlertmanagerNotificationsFailing
+              job: alertmanager
+              instance: alertmanager:9093
+              integration: webhook
+              reason: clientError
+              severity: critical
+            exp_annotations:
+              summary: "Alertmanager cannot deliver via webhook"
+              description: >-
+                Notifications through webhook have been failing for 10 minutes on
+                alertmanager:9093. Alerts are being generated and grouped but nobody is
+                receiving them.
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#alertmanagernotificationsfailing

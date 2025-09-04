@@ -1,0 +1,143 @@
+# Unit tests for the latency SLO.
+#
+# The latency SLI is derived from a bucket boundary, not from a quantile, so the
+# tests feed real histogram buckets. The second case is the one that matters: a
+# short total stall drives the 5m window to 100% and is still, correctly, not a
+# page - which is exactly what a single-window alert would have got wrong.
+rule_files:
+  - ../recording.yml
+  - ../alerting.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------------------
+  # Steady 10 req/s. Everything is under 100 ms until minute 60, after which 40%
+  # of requests land between 300 ms and 1 s and stay there.
+  #
+  # As in availability_test.yml, firing is asserted once the relevant rate window
+  # is entirely inside the regression - minute 180 for the 1h window, minute 480
+  # for the 6h one - so the expected numbers are the injected ones and not a
+  # by-product of a window straddling the onset.
+  # ---------------------------------------------------------------------------
+  - interval: 2m
+    name: a sustained latency regression burns the latency budget
+    input_series:
+      - series: 'http_request_duration_seconds_bucket{job="sample-app", instance="sample-app:8000", le="0.1"}'
+        values: "0+1200x30 36720+720x210"
+      - series: 'http_request_duration_seconds_bucket{job="sample-app", instance="sample-app:8000", le="0.3"}'
+        values: "0+1200x30 36720+720x210"
+      - series: 'http_request_duration_seconds_bucket{job="sample-app", instance="sample-app:8000", le="1"}'
+        values: "0+1200x241"
+      - series: 'http_request_duration_seconds_bucket{job="sample-app", instance="sample-app:8000", le="+Inf"}'
+        values: "0+1200x241"
+      - series: 'http_request_duration_seconds_count{job="sample-app", instance="sample-app:8000"}'
+        values: "0+1200x241"
+
+    promql_expr_test:
+      # Before the regression the SLI is a clean zero, afterwards it is the
+      # injected 40%. If this drifts, every threshold below is meaningless.
+      - expr: job:http_request_duration_seconds:slow_ratio_rate5m
+        eval_time: 40m
+        exp_samples:
+          - labels: 'job:http_request_duration_seconds:slow_ratio_rate5m{job="sample-app"}'
+            value: 0
+      - expr: job:http_request_duration_seconds:slow_ratio_rate5m
+        eval_time: 180m
+        exp_samples:
+          - labels: 'job:http_request_duration_seconds:slow_ratio_rate5m{job="sample-app"}'
+            value: 0.4
+
+    alert_rule_test:
+      # Two minutes into the regression the 1h window has barely moved. This is
+      # the point of the long window: it refuses to page on a two-minute blip.
+      - eval_time: 62m
+        alertname: LatencyBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 62m
+        alertname: LatencyBudgetBurnSlow
+        exp_alerts: []
+
+      - eval_time: 180m
+        alertname: LatencyBudgetBurnFast
+        exp_alerts:
+          - exp_labels:
+              alertname: LatencyBudgetBurnFast
+              job: sample-app
+              severity: critical
+              slo: latency
+            exp_annotations:
+              summary: "Latency error budget burning at 14.4x on sample-app"
+              description: >-
+                40% of requests to sample-app took longer than 300 ms over the last hour.
+                At this rate the 30-day latency budget (99% under 300 ms) is exhausted in
+                about 2 days.
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#latencybudgetburnfast
+
+      - eval_time: 480m
+        alertname: LatencyBudgetBurnSlow
+        exp_alerts:
+          - exp_labels:
+              alertname: LatencyBudgetBurnSlow
+              job: sample-app
+              severity: warning
+              slo: latency
+            exp_annotations:
+              summary: "Latency error budget burning at 6x on sample-app"
+              description: >-
+                40% of requests to sample-app took longer than 300 ms over the last 6 hours.
+                The 30-day latency budget is exhausted in about 5 days at this rate.
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#latencybudgetburnslow
+
+      # Slow requests are still successful requests: availability is untouched.
+      - eval_time: 180m
+        alertname: ErrorBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 480m
+        alertname: ErrorBudgetBurnSlow
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # Six hours of healthy traffic, then a six-minute stall where every request is
+  # slower than 300 ms, then recovery. The 5m SLI hits 1.0; neither alert fires.
+  # A single-window `slow_ratio_rate5m > 0.01` alert would have paged at 03:00 for
+  # something that consumed 1.7% of a month's budget.
+  # ---------------------------------------------------------------------------
+  - interval: 2m
+    name: a six-minute stall spikes the short window without paging
+    input_series:
+      - series: 'http_request_duration_seconds_bucket{job="sample-app", instance="sample-app:8000", le="0.1"}'
+        values: "0+1200x180 216000+0x2 217200+1200x17"
+      - series: 'http_request_duration_seconds_bucket{job="sample-app", instance="sample-app:8000", le="0.3"}'
+        values: "0+1200x180 216000+0x2 217200+1200x17"
+      - series: 'http_request_duration_seconds_bucket{job="sample-app", instance="sample-app:8000", le="1"}'
+        values: "0+1200x201"
+      - series: 'http_request_duration_seconds_bucket{job="sample-app", instance="sample-app:8000", le="+Inf"}'
+        values: "0+1200x201"
+      - series: 'http_request_duration_seconds_count{job="sample-app", instance="sample-app:8000"}'
+        values: "0+1200x201"
+
+    promql_expr_test:
+      # The stall really is total - the short window sees 100% violations.
+      - expr: job:http_request_duration_seconds:slow_ratio_rate5m
+        eval_time: 364m
+        exp_samples:
+          - labels: 'job:http_request_duration_seconds:slow_ratio_rate5m{job="sample-app"}'
+            value: 1
+
+    alert_rule_test:
+      - eval_time: 364m
+        alertname: LatencyBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 370m
+        alertname: LatencyBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 370m
+        alertname: LatencyBudgetBurnSlow
+        exp_alerts: []
+      - eval_time: 400m
+        alertname: LatencyBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 400m
+        alertname: LatencyBudgetBurnSlow
+        exp_alerts: []

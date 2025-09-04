@@ -1,0 +1,198 @@
+# Unit tests for the availability burn-rate alerts.
+#
+# The point of these tests is calibration, not syntax: a burn-rate alert with the
+# wrong factor is still valid PromQL and still loads into Prometheus. The three
+# cases below pin the boundaries of the alert - 5x stays quiet, 7x opens a ticket,
+# 100x pages - so that changing a threshold breaks CI instead of production.
+rule_files:
+  - ../recording.yml
+  - ../alerting.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------------------
+  # A hard error burst: 10% of requests start failing one hour in and never stop.
+  # That is a 100x burn rate, so the fast page must arrive within minutes and the
+  # slow ticket follows once its 15-minute `for` elapses.
+  #
+  # Firing is asserted at minute 480, once every rate window sits entirely inside
+  # the incident. While a window still straddles the onset the SLI is a moving
+  # number, and asserting on a moving number would pin an artefact of the ramp
+  # rather than the behaviour under test.
+  # ---------------------------------------------------------------------------
+  - interval: 2m
+    name: error burst pages on the fast burn-rate window
+    input_series:
+      - series: 'http_requests_total{job="sample-app", instance="sample-app:8000", method="GET", path="/api/items", status="200"}'
+        values: "0+1080x241"
+      - series: 'http_requests_total{job="sample-app", instance="sample-app:8000", method="GET", path="/api/items", status="500"}'
+        values: "0+0x30 0+120x210"
+
+    promql_expr_test:
+      - expr: job:http_requests_errors:ratio_rate5m
+        eval_time: 40m
+        exp_samples:
+          - labels: 'job:http_requests_errors:ratio_rate5m{job="sample-app"}'
+            value: 0
+      - expr: job:http_requests_errors:ratio_rate5m
+        eval_time: 480m
+        exp_samples:
+          - labels: 'job:http_requests_errors:ratio_rate5m{job="sample-app"}'
+            value: 0.1
+
+    alert_rule_test:
+      # An hour in nothing has gone wrong yet.
+      - eval_time: 40m
+        alertname: ErrorBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: ErrorBudgetBurnSlow
+        exp_alerts: []
+
+      # Two minutes after onset the `for` clause has not elapsed: no page yet.
+      - eval_time: 62m
+        alertname: ErrorBudgetBurnFast
+        exp_alerts: []
+
+      # Ten minutes after onset the page is out; the ticket still needs its 15m.
+      - eval_time: 70m
+        alertname: ErrorBudgetBurnSlow
+        exp_alerts: []
+
+      - eval_time: 480m
+        alertname: ErrorBudgetBurnFast
+        exp_alerts:
+          - exp_labels:
+              alertname: ErrorBudgetBurnFast
+              job: sample-app
+              severity: critical
+              slo: availability
+            exp_annotations:
+              summary: "Availability error budget burning at 14.4x on sample-app"
+              description: >-
+                sample-app is returning 10% 5xx over the last hour and the last 5 minutes.
+                At this rate the 30-day availability budget (99.9%) is exhausted in about 2 days.
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#errorbudgetburnfast
+      - eval_time: 480m
+        alertname: ErrorBudgetBurnSlow
+        exp_alerts:
+          - exp_labels:
+              alertname: ErrorBudgetBurnSlow
+              job: sample-app
+              severity: warning
+              slo: availability
+            exp_annotations:
+              summary: "Availability error budget burning at 6x on sample-app"
+              description: >-
+                sample-app is returning 10% 5xx over the last 6 hours. At this rate the
+                30-day availability budget is exhausted in about 5 days. Investigate during
+                working hours.
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#errorbudgetburnslow
+
+      # HighErrorRatio explicitly excludes jobs that have an SLO, so a service
+      # covered by burn-rate alerts never produces two tickets for one incident.
+      - eval_time: 480m
+        alertname: HighErrorRatio
+        exp_alerts: []
+
+      # Nothing here is a latency or traffic problem.
+      - eval_time: 480m
+        alertname: LatencyBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 480m
+        alertname: TrafficDropped
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # 0.5% errors against a 0.1% budget - a 5x burn rate. It is over budget, and it
+  # is deliberately not alertable: the slow window opens a ticket at 6x. This is
+  # the case a naive `ratio > 0.001` alert would page on every single day.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    name: burning at 5x stays below both alerting thresholds
+    input_series:
+      - series: 'http_requests_total{job="sample-app", instance="sample-app:8000", method="GET", path="/api/items", status="200"}'
+        values: "0+597x181"
+      - series: 'http_requests_total{job="sample-app", instance="sample-app:8000", method="GET", path="/api/items", status="500"}'
+        values: "0+3x181"
+
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: ErrorBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: ErrorBudgetBurnSlow
+        exp_alerts: []
+      - eval_time: 180m
+        alertname: ErrorBudgetBurnSlow
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # 0.75% errors - a 7.5x burn rate. Above the slow threshold, below the fast one:
+  # a ticket, never a page. This is the case that justifies having two windows.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    name: burning at 7.5x opens a ticket but does not page
+    input_series:
+      - series: 'http_requests_total{job="sample-app", instance="sample-app:8000", method="GET", path="/api/items", status="200"}'
+        values: "0+595.5x121"
+      - series: 'http_requests_total{job="sample-app", instance="sample-app:8000", method="GET", path="/api/items", status="500"}'
+        values: "0+4.5x121"
+
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: ErrorBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: ErrorBudgetBurnSlow
+        exp_alerts:
+          - exp_labels:
+              alertname: ErrorBudgetBurnSlow
+              job: sample-app
+              severity: warning
+              slo: availability
+            exp_annotations:
+              summary: "Availability error budget burning at 6x on sample-app"
+              description: >-
+                sample-app is returning 0.75% 5xx over the last 6 hours. At this rate the
+                30-day availability budget is exhausted in about 5 days. Investigate during
+                working hours.
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#errorbudgetburnslow
+
+  # ---------------------------------------------------------------------------
+  # A job with no SLO document. The flat 5% backstop is the only thing covering it.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    name: a job without an SLO falls back to the flat error-ratio alert
+    input_series:
+      - series: 'http_requests_total{job="legacy-api", instance="legacy-api:8080", method="POST", path="/v1/pay", status="200"}'
+        values: "0+540x61"
+      - series: 'http_requests_total{job="legacy-api", instance="legacy-api:8080", method="POST", path="/v1/pay", status="503"}'
+        values: "0+60x61"
+
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HighErrorRatio
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: HighErrorRatio
+        exp_alerts:
+          - exp_labels:
+              alertname: HighErrorRatio
+              job: legacy-api
+              severity: warning
+            exp_annotations:
+              summary: "legacy-api is failing 10% of requests"
+              description: >-
+                More than 5% of requests to legacy-api returned 5xx over the last 5 minutes.
+                This job has no SLO definition, so the threshold is a flat one - add it to
+                slo/ if the service is user-facing.
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#higherrorratio
+      # The burn-rate alerts are scoped to sample-app and must ignore this job.
+      - eval_time: 30m
+        alertname: ErrorBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: ErrorBudgetBurnSlow
+        exp_alerts: []
