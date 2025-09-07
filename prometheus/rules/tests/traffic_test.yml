@@ -1,0 +1,88 @@
+# Unit tests for the traffic-drop alert.
+#
+# Every ratio-based alert in this repository divides by the request rate, so a
+# service that receives no requests at all looks perfectly healthy to all of them.
+# TrafficDropped is the alert that covers that blind spot, and the second case
+# pins the guard that keeps it from screaming about naturally idle services.
+rule_files:
+  - ../recording.yml
+  - ../alerting.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------------------
+  # Two hours at 10 req/s, then traffic collapses to 0.1 req/s. Nothing is failing
+  # and nothing is slow - the requests simply stopped arriving.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    name: a collapse in request rate is caught by the 6h baseline
+    input_series:
+      - series: 'http_requests_total{job="sample-app", instance="sample-app:8000", method="GET", path="/api/items", status="200"}'
+        values: "0+600x120 72006+6x79"
+
+    promql_expr_test:
+      - expr: job:http_requests:rate5m
+        eval_time: 100m
+        exp_samples:
+          - labels: 'job:http_requests:rate5m{job="sample-app"}'
+            value: 10
+      - expr: job:http_requests:rate5m
+        eval_time: 160m
+        exp_samples:
+          - labels: 'job:http_requests:rate5m{job="sample-app"}'
+            value: 0.1
+
+    alert_rule_test:
+      - eval_time: 100m
+        alertname: TrafficDropped
+        exp_alerts: []
+      # `for: 10m` has not elapsed yet.
+      - eval_time: 125m
+        alertname: TrafficDropped
+        exp_alerts: []
+      - eval_time: 160m
+        alertname: TrafficDropped
+        exp_alerts:
+          - exp_labels:
+              alertname: TrafficDropped
+              job: sample-app
+              severity: warning
+            exp_annotations:
+              summary: "Request rate to sample-app fell to 0.10 req/s"
+              description: >-
+                sample-app is serving less than a quarter of its 6-hour baseline traffic.
+                Either an upstream stopped calling it, or requests are failing before they
+                reach the instrumentation (ingress, DNS, TLS).
+              runbook_url: https://github.com/lpogosu/observability-stack/blob/main/docs/runbooks.md#trafficdropped
+
+      # No 5xx and no slow requests: the SLO alerts must stay quiet, which is
+      # precisely why this alert has to exist.
+      - eval_time: 160m
+        alertname: ErrorBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 160m
+        alertname: ErrorBudgetBurnSlow
+        exp_alerts: []
+      - eval_time: 160m
+        alertname: LatencyBudgetBurnFast
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # A service that only ever sees 0.5 req/s. Its traffic going to zero is not
+  # distinguishable from a quiet afternoon, so the alert is suppressed by the
+  # `rate6h > 1` guard rather than producing an unactionable page every night.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    name: a naturally low-traffic service does not trigger the drop alert
+    input_series:
+      - series: 'http_requests_total{job="sample-app", instance="sample-app:8000", method="POST", path="/api/orders", status="200"}'
+        values: "0+30x120 3600+0x79"
+
+    alert_rule_test:
+      - eval_time: 160m
+        alertname: TrafficDropped
+        exp_alerts: []
+      - eval_time: 190m
+        alertname: TrafficDropped
+        exp_alerts: []

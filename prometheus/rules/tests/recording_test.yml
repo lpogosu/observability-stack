@@ -1,0 +1,122 @@
+# Unit tests for the recording rules themselves.
+#
+# Alert tests prove the thresholds; these prove the arithmetic underneath them.
+# They also pin the aggregation level: if someone adds `instance` back into a
+# `job:` rule the expected sample list stops matching and CI fails, which is the
+# cheapest cardinality guard available.
+rule_files:
+  - ../recording.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    name: RED aggregations collapse to the documented label sets
+    input_series:
+      # 6 req/s of successful reads, 1 req/s of failing reads, 3 req/s of writes.
+      - series: 'http_requests_total{job="sample-app", instance="sample-app:8000", method="GET", path="/api/items", status="200"}'
+        values: "0+360x30"
+      - series: 'http_requests_total{job="sample-app", instance="sample-app:8000", method="GET", path="/api/items", status="500"}'
+        values: "0+60x30"
+      - series: 'http_requests_total{job="sample-app", instance="sample-app:8000", method="POST", path="/api/orders", status="200"}'
+        values: "0+180x30"
+
+    promql_expr_test:
+      # instance, method and status are gone; only `job` survives.
+      - expr: job:http_requests:rate5m
+        eval_time: 20m
+        exp_samples:
+          - labels: 'job:http_requests:rate5m{job="sample-app"}'
+            value: 10
+
+      - expr: job:http_requests_errors:rate5m
+        eval_time: 20m
+        exp_samples:
+          - labels: 'job:http_requests_errors:rate5m{job="sample-app"}'
+            value: 1
+
+      - expr: job:http_requests_errors:ratio_rate5m
+        eval_time: 20m
+        exp_samples:
+          - labels: 'job:http_requests_errors:ratio_rate5m{job="sample-app"}'
+            value: 0.1
+
+      # All four burn-rate windows must agree on a constant-rate input, otherwise
+      # the multi-window alert would compare incompatible numbers.
+      - expr: job:http_requests_errors:ratio_rate30m
+        eval_time: 30m
+        exp_samples:
+          - labels: 'job:http_requests_errors:ratio_rate30m{job="sample-app"}'
+            value: 0.1
+      - expr: job:http_requests_errors:ratio_rate1h
+        eval_time: 30m
+        exp_samples:
+          - labels: 'job:http_requests_errors:ratio_rate1h{job="sample-app"}'
+            value: 0.1
+      - expr: job:http_requests_errors:ratio_rate6h
+        eval_time: 30m
+        exp_samples:
+          - labels: 'job:http_requests_errors:ratio_rate6h{job="sample-app"}'
+            value: 0.09999999999999999
+
+      # The per-path rule keeps exactly one extra label.
+      - expr: job_path:http_requests:rate5m
+        eval_time: 20m
+        exp_samples:
+          - labels: 'job_path:http_requests:rate5m{job="sample-app", path="/api/items"}'
+            value: 7
+          - labels: 'job_path:http_requests:rate5m{job="sample-app", path="/api/orders"}'
+            value: 3
+
+      # A path with no 5xx produces no series at all rather than a zero. This is a
+      # PromQL property worth pinning: dashboards must handle the absence, and
+      # `job_path:...ratio` panels use "no value" rather than drawing a false 0%.
+      - expr: job_path:http_requests_errors:ratio_rate5m
+        eval_time: 20m
+        exp_samples:
+          - labels: 'job_path:http_requests_errors:ratio_rate5m{job="sample-app", path="/api/items"}'
+            value: 0.14285714285714285
+
+  - interval: 1m
+    name: latency aggregations are derived from buckets, not from quantiles
+    input_series:
+      - series: 'http_request_duration_seconds_bucket{job="sample-app", instance="sample-app:8000", le="0.1"}'
+        values: "0+300x30"
+      - series: 'http_request_duration_seconds_bucket{job="sample-app", instance="sample-app:8000", le="0.3"}'
+        values: "0+540x30"
+      - series: 'http_request_duration_seconds_bucket{job="sample-app", instance="sample-app:8000", le="0.5"}'
+        values: "0+600x30"
+      - series: 'http_request_duration_seconds_bucket{job="sample-app", instance="sample-app:8000", le="1"}'
+        values: "0+600x30"
+      - series: 'http_request_duration_seconds_bucket{job="sample-app", instance="sample-app:8000", le="+Inf"}'
+        values: "0+600x30"
+      - series: 'http_request_duration_seconds_count{job="sample-app", instance="sample-app:8000"}'
+        values: "0+600x30"
+      - series: 'http_request_duration_seconds_sum{job="sample-app", instance="sample-app:8000"}'
+        values: "0+90x30"
+
+    promql_expr_test:
+      # 10 req/s total, 9 of them under the 300 ms objective -> 10% violations.
+      - expr: job:http_request_duration_seconds:slow_ratio_rate5m
+        eval_time: 20m
+        exp_samples:
+          - labels: 'job:http_request_duration_seconds:slow_ratio_rate5m{job="sample-app"}'
+            value: 0.09999999999999998
+
+      - expr: job:http_request_duration_seconds:p50_rate5m
+        eval_time: 20m
+        exp_samples:
+          - labels: 'job:http_request_duration_seconds:p50_rate5m{job="sample-app"}'
+            value: 0.1
+
+      - expr: job:http_request_duration_seconds:p90_rate5m
+        eval_time: 20m
+        exp_samples:
+          - labels: 'job:http_request_duration_seconds:p90_rate5m{job="sample-app"}'
+            value: 0.3
+
+      - expr: job:http_request_duration_seconds:p99_rate5m
+        eval_time: 20m
+        exp_samples:
+          - labels: 'job:http_request_duration_seconds:p99_rate5m{job="sample-app"}'
+            value: 0.4800000000000001
