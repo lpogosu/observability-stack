@@ -1,0 +1,90 @@
+# Service level objectives for the sample application.
+#
+# This file is the source of truth for the numbers; prometheus/rules/alerting.yml
+# is its implementation. tests/test_slo_rules_consistency.py fails the build if
+# the two drift apart, so an SLO cannot be renegotiated in a document while the
+# alerts keep enforcing the old one.
+service: sample-app
+window: 30d
+
+objectives:
+  - name: availability
+    description: >-
+      A request is good when it is answered without a 5xx. Client errors are
+      excluded: a caller sending a malformed body is not the service missing its
+      objective, and counting those would let a broken client silently consume
+      the budget of a healthy service.
+    target: 0.999
+    error_budget: 0.001
+    # 30 days at the demo's steady 20 req/s is about 52 million requests, so the
+    # budget is roughly 52 000 failed requests, or 12 minutes of total outage.
+    sli:
+      good: 'sum(rate(http_requests_total{job="sample-app", status!~"5.."}[window]))'
+      total: 'sum(rate(http_requests_total{job="sample-app"}[window]))'
+      recording_rule_prefix: "job:http_requests_errors:ratio_rate"
+    alerting:
+      - alert: ErrorBudgetBurnFast
+        severity: critical
+        burn_rate: 14.4
+        long_window: 1h
+        short_window: 5m
+        for: 2m
+        # Fraction of the 30-day budget already spent when this alert fires.
+        budget_consumed_at_detection: 0.02
+        time_to_exhaustion: 2d
+      - alert: ErrorBudgetBurnSlow
+        severity: warning
+        burn_rate: 6
+        long_window: 6h
+        short_window: 30m
+        for: 15m
+        budget_consumed_at_detection: 0.05
+        time_to_exhaustion: 5d
+
+  - name: latency
+    description: >-
+      A request is good when it is served in under 300 ms, measured server-side
+      from the first middleware to the last byte handed to the ASGI server.
+      Network time to the client is outside the service's control and outside
+      this objective; the blackbox probe covers that separately.
+    target: 0.99
+    error_budget: 0.01
+    threshold_seconds: 0.3
+    sli:
+      good: >-
+        sum(rate(http_request_duration_seconds_bucket{job="sample-app",
+        le="0.3"}[window]))
+      total: 'sum(rate(http_request_duration_seconds_count{job="sample-app"}[window]))'
+      recording_rule_prefix: "job:http_request_duration_seconds:slow_ratio_rate"
+    alerting:
+      - alert: LatencyBudgetBurnFast
+        severity: critical
+        burn_rate: 14.4
+        long_window: 1h
+        short_window: 5m
+        for: 2m
+        budget_consumed_at_detection: 0.02
+        time_to_exhaustion: 2d
+      - alert: LatencyBudgetBurnSlow
+        severity: warning
+        burn_rate: 6
+        long_window: 6h
+        short_window: 30m
+        for: 15m
+        budget_consumed_at_detection: 0.05
+        time_to_exhaustion: 5d
+
+# Traffic to the service is not itself an objective - users do not experience
+# "requests per second" - but its disappearance hides every ratio-based SLI, so
+# it gets its own alert outside this file. See TrafficDropped.
+not_objectives:
+  - name: request_rate
+    reason: >-
+      A ratio SLI divides by traffic. When traffic goes to zero the numerator and
+      the denominator vanish together and both objectives report perfect health,
+      so the collapse is alerted on directly rather than folded into an SLO.
+  - name: cpu_and_memory_saturation
+    reason: >-
+      Saturation is a cause, not a symptom. A service at 95% CPU that still meets
+      both objectives needs a capacity plan, not a page at 03:00. These metrics
+      are on the dashboards for the person already looking at an incident.
